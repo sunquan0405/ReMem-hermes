@@ -195,6 +195,19 @@ The Glue Layer sits in `rulebook.md` and `SOUL.md` — it tells the agent **whic
 
 ---
 
+## Troubleshooting
+
+Common issues and their fixes: [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| qdrant_search empty | indexing_threshold=10000, HNSW not built | Lower to 20 |
+| curl :8000 fails | Worker is ARQ, not HTTP | Use Docker health check |
+| curl :6333 returns 401 | Missing API key header | Add `-H "api-key: $KEY"` |
+| curl returns 502 | Clash proxy intercepting localhost | Set no_proxy |
+
+---
+
 ## Quick Start
 
 ### Prerequisites
