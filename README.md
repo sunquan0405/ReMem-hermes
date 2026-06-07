@@ -28,9 +28,9 @@
 You hit it. You know you hit it because the `memory` tool starts refusing writes. The only fix is to delete old entries — manually, one by one, guessing which ones you no longer need.
 
 ```
-  原生 memory 条数   已用字符    剩余空间
-  ────────────────  ────────    ────────
-    48 entries        9,867        133     ← 随时会满
+  Native entries  Chars used  Room left
+  ───────────────  ─────────  ─────────
+    48 entries      9,867        133     ← Overflow imminent
 ```
 
 ReMem uses SQLite (`memory_store.db`) + Qdrant for storage. No character limit. No guessing what to delete. Disk is the only boundary.
@@ -141,7 +141,7 @@ To put that in perspective: a single `hermes chat` with DeepSeek V4 Pro costs mo
                                ┌──────────────────────┐
                                │      Glue Layer      │
                                │  (query + storage    │
-  "记住这个" or "查那个" ──────▶   routing in rulebook) │
+    "remember this" or "look that up" ──────▶   routing in rulebook) │
                                └──────┬───────┬───────┘
                                       │       │
                               ┌───────┘       └───────┐
