@@ -235,6 +235,77 @@ grep -E 'EMBEDDING_URL|EMBEDDING_MODEL' ~/.hermes/plugins/icarus/scripts/context
 
 ---
 
+---
+
+## Symptom: Wiki files not searchable in Qdrant (only memory entries indexed)
+
+### Root cause
+
+The wiki continuous ingestion pipeline (`wiki_continuous_ingest.py`) exists but is **configured for the wrong path by default**:
+- `WIKI_ROOT` defaults to `~/Vault/wiki` (Karpathy convention) — doesn't exist
+- Docker mount `${MEMORY_OS_WIKI_PATH:-./wiki}` resolves to `~/memory-os/docker/wiki/` — empty directory
+- 300+ `.md` files in `~/wiki` never reach Qdrant
+
+### Fix
+
+```bash
+# 1. Set correct wiki path in docker-compose .env
+echo "MEMORY_OS_WIKI_PATH=/Users/$(whoami)/wiki" >> ~/memory-os/docker/.env
+
+# 2. Restart worker to remount
+cd ~/memory-os/docker && docker compose up -d --force-recreate worker
+
+# 3. Clear stale state file, run full ingest
+rm -f ~/.hermes/wiki_ingest_state.json
+WIKI_ROOT=~/wiki REDIS_PASSWORD=$(docker exec docker-redis-1 printenv REDIS_PASSWORD) \
+  python3 ~/memory-os/scripts/wiki_continuous_ingest.py
+```
+
+### Verify
+
+```bash
+QKEY=$(docker exec docker-qdrant-1 printenv QDRANT__SERVICE__API_KEY)
+curl -s -H "api-key: $QKEY" http://127.0.0.1:6333/collections/knowledge_base \
+  | python3 -c "import sys,json; d=json.load(sys.stdin)['result']; \
+     print(f'points={d[\"points_count\"]}')"
+# Before fix: ~49 (memory migration only)
+# After fix: ~350 (memory + wiki)
+```
+
+### Set up periodic incremental sync
+
+```bash
+# Add to cron (runs every 30 min)
+WIKI_ROOT=~/wiki REDIS_PASSWORD=$(docker exec docker-redis-1 printenv REDIS_PASSWORD) \
+  python3 ~/memory-os/scripts/wiki_continuous_ingest.py
+```
+
+---
+
+## Symptom: Worker embedding calls fail with ConnectError despite correct env
+
+### Root cause
+
+Docker daemon injects host proxy settings (`http_proxy=http://127.0.0.1:7897`) into containers. The container tries to route DashScope API calls through `127.0.0.1:7897`, where no Clash proxy exists — connection refused.
+
+### Fix
+
+In `~/memory-os/docker/docker-compose.yml`, explicitly clear proxy vars in the worker section:
+
+```yaml
+environment:
+  http_proxy: ""
+  https_proxy: ""
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  no_proxy: "qdrant,redis,localhost,127.0.0.1,dashscope.aliyuncs.com"
+  NO_PROXY: "qdrant,redis,localhost,127.0.0.1,dashscope.aliyuncs.com"
+```
+
+Then rebuild: `docker compose up -d --force-recreate --build worker`
+
+---
+
 ## All Services Health Check (one command)
 
 ```bash
