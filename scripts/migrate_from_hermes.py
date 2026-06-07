@@ -226,8 +226,7 @@ def migrate_to_qdrant(entries: list, dry_run: bool = False) -> int:
         points.append({
             "id": i + 1,
             "vector": {
-                "dense": None,  # 让 worker 后续计算
-                "sparse": None,  # 或通过 embedding API 即时计算
+                "dense": [0.0] * 4096,  # placeholder, actual embedding comes from Worker pipeline
             },
             "payload": {
                 "content": content,
