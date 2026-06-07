@@ -185,6 +185,54 @@ All DeepSeek models (v4-flash, v4-pro, chat) are **chat-only**. If `EMBEDDING_MO
 
 If you switch from Qwen (1024-dim) to OpenRouter (4096-dim), you MUST recreate the Qdrant collection — existing 1024-dim vectors cannot be searched against 4096-dim queries. The mismatch causes `qdrant_search` to fail silently.
 
+### ⚠️ Python code defaults silently override docker-compose env
+
+**The trap:** Setting `EMBEDDING_API_BASE=dashscope...` in docker-compose `.env` or `docker-compose.yml` is NOT enough. Five Python files hardcode OpenRouter as the fallback default via `os.environ.get("KEY", "openrouter-fallback")`. If the env var is ever missing (config drift, docker restart without .env sourcing), the system silently falls back to OpenRouter — no warning, no error.
+
+**Files that hardcode OpenRouter defaults (all in `~/memory-os/`):**
+
+| File | Hardcoded Default |
+|------|-------------------|
+| `docker/worker/services/embedding.py` | `EMBEDDING_API_BASE` → `openrouter.ai/api/v1`<br>`EMBEDDING_MODEL` → `qwen/qwen3-embedding-8b`<br>`EMBEDDING_DIMS` → `4096`<br>Auth: `if "openrouter" in base` branch |
+| `docker/worker/services/local_qdrant.py` | `EMBEDDING_DIMS` → `4096` |
+| `scripts/context_enhancer.py` | `EMBEDDING_URL` → `openrouter.ai/api` + `/v1/embeddings`<br>`EMBEDDING_MODEL` → `qwen/qwen3-embedding-8b`<br>(Hermes uses this via symlink at `~/.hermes/plugins/icarus/scripts/`) |
+| `scripts/bulk_wiki_ingest.py` | `EMBEDDING_MODEL` → `qwen/qwen3-embedding-8b` |
+| `scripts/pre_validator.py` | `EMBEDDING_MODEL` → `qwen/qwen3-embedding-8b` (hardcoded, no env var) |
+
+**Permanent fix — change the Python defaults themselves:**
+
+```bash
+# Change all defaults from OpenRouter → Qwen DashScope
+# EMBEDDING_API_BASE: openrouter.ai/api/v1 → dashscope.aliyuncs.com/compatible-mode/v1
+# EMBEDDING_MODEL: qwen/qwen3-embedding-8b → text-embedding-v4
+# EMBEDDING_DIMS: 4096 → 1024
+# Auth: "if openrouter" branch → EMBEDDING_API_KEY first, OpenRouter fallback
+```
+
+Then rebuild the Worker image:
+```bash
+cd ~/memory-os/docker && docker compose up -d --force-recreate --build worker
+```
+
+**Verify defaults are correct:**
+```bash
+docker exec docker-worker-1 python3 -c "
+from services.embedding import EMBEDDING_API_BASE, EMBEDDING_MODEL, EMBEDDING_DIMS
+print(f'BASE: {EMBEDDING_API_BASE}')
+print(f'MODEL: {EMBEDDING_MODEL}')
+print(f'DIMS: {EMBEDDING_DIMS}')
+"
+# Expected: dashscope.aliyuncs.com/compatible-mode/v1, text-embedding-v4, 1024
+```
+
+**Also check the Hermes-side context enhancer** (symlinked from `~/memory-os/scripts/`):
+```bash
+grep -E 'EMBEDDING_URL|EMBEDDING_MODEL' ~/.hermes/plugins/icarus/scripts/context_enhancer.py
+# Expected: dashscope.aliyuncs.com, text-embedding-v4
+```
+
+**Why this keeps happening:** docker-compose env vars are a surface-level fix. Code defaults are the source of truth. Always fix both layers.
+
 ---
 
 ## All Services Health Check (one command)
