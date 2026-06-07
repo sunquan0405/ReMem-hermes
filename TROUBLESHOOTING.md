@@ -340,3 +340,47 @@ sqlite3 ~/.hermes/state.db "SELECT type, status, count(*) FROM fabric_index GROU
 # Session stats
 sqlite3 ~/.hermes/state.db "SELECT count(DISTINCT session_id) as sessions, count(*) as messages FROM messages;"
 ```
+
+---
+
+## Symptom: BM25 sparse model re-downloads on every container rebuild
+
+### Root cause
+
+FastEmbed caches models to `/tmp/fastembed_cache/` inside the container. This path is on the ephemeral container filesystem — lost on `--force-recreate` or Mac reboot.
+
+### Fix
+
+Add a named Docker volume to persist the cache:
+
+```yaml
+# docker-compose.yml — worker volumes section
+volumes:
+  - hf_cache:/tmp/fastembed_cache
+
+# docker-compose.yml — volumes declaration
+volumes:
+  hf_cache:
+```
+
+Also pre-create the cache directory with correct ownership in the Dockerfile (required because named volumes inherit permissions from the image):
+
+```dockerfile
+RUN mkdir -p /tmp/fastembed_cache && chown appuser:appuser /tmp/fastembed_cache
+```
+
+### Verify
+
+```bash
+# Rebuild with volume
+docker compose up -d --force-recreate --build worker
+
+# Check model is cached
+docker exec docker-worker-1 du -sh /tmp/fastembed_cache/
+# Expected: ~160K, 21 files
+
+# Force-recreate again to verify persistence
+docker compose up -d --force-recreate worker
+docker logs docker-worker-1 | grep "BM25"
+# Expected: "BM25 sparse model pre-warmed" — instant, no download
+```
