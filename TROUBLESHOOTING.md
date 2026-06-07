@@ -129,6 +129,64 @@ echo "Collection dims: $COLL_DIMS"
 
 ---
 
+## Symptom: Embedding API returns errors or wrong dimensions
+
+### Root cause
+
+The embedding model MUST be an embedding model, not a chat model. Common mistakes:
+
+- `deepseek-v4-flash` — CHAT model, has NO embedding endpoint
+- `deepseek-chat` — CHAT model
+- Switching providers without updating the model name
+
+### Correct embedding models
+
+| Provider | Model | Dims | API Base |
+|----------|-------|------|----------|
+| Qwen DashScope (recommended) | `text-embedding-v4` | 1024 | `dashscope.aliyuncs.com/compatible-mode/v1` |
+| OpenRouter | `qwen/qwen3-embedding-8b` | 4096 | `openrouter.ai/api/v1` |
+
+### Check current config
+
+```bash
+grep -E 'EMBEDDING_(MODEL|API_KEY|BASE_URL)' ~/.hermes/.env
+```
+
+Expected (Qwen DashScope direct):
+```
+EMBEDDING_API_KEY=sk-...
+EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+EMBEDDING_MODEL=text-embedding-v4
+```
+
+### Verify embedding works
+
+```bash
+python3 -c "
+import requests, os, json
+key = os.environ.get('EMBEDDING_API_KEY', '')
+base = os.environ.get('EMBEDDING_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+model = os.environ.get('EMBEDDING_MODEL', 'text-embedding-v4')
+r = requests.post(f'{base}/embeddings',
+    headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+    json={'model': model, 'input': 'test'},
+    timeout=30)
+dims = len(r.json()['data'][0]['embedding'])
+print(f'{model}: {r.status_code}, {dims} dims')
+"
+# Expected: text-embedding-v4: 200, 1024 dims
+```
+
+### ⚠️ DeepSeek has NO embedding models
+
+All DeepSeek models (v4-flash, v4-pro, chat) are **chat-only**. If `EMBEDDING_MODEL` is set to any DeepSeek model, the API returns `400 Bad Request` or hangs. Use Qwen DashScope or OpenRouter for embeddings.
+
+### ⚠️ Dimension must match Qdrant collection
+
+If you switch from Qwen (1024-dim) to OpenRouter (4096-dim), you MUST recreate the Qdrant collection — existing 1024-dim vectors cannot be searched against 4096-dim queries. The mismatch causes `qdrant_search` to fail silently.
+
+---
+
 ## All Services Health Check (one command)
 
 ```bash
