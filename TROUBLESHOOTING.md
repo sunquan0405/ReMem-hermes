@@ -306,6 +306,69 @@ Then rebuild: `docker compose up -d --force-recreate --build worker`
 
 ---
 
+## Symptom: Worker restarted but no reflection output visible
+
+### Root cause
+
+The Worker runs `cron:process_reflection` every 2 hours at even-numbered hours (:00). If the Worker was restarted mid-hour, it will wait until the next even hour to run its first reflection. No output during the gap is normal.
+
+### Check when the next reflection will run
+
+```bash
+# Worker cron schedule (in the code, not configurable via env)
+docker logs docker-worker-1 | grep "Starting worker"
+# Lists 5 functions including "cron:process_reflection"
+
+# Check code for schedule:
+grep 'cron(process_reflection' ~/memory-os/docker/worker/main.py
+# Expected: cron(process_reflection, hour={0, 2, 4, ..., 22}, minute=0)
+```
+
+### Verify reflections are working
+
+```bash
+# Check for completed reflection runs (not just failures)
+docker logs docker-worker-1 2>&1 | grep -i 'reflection' | tail -10
+
+# Count failures:
+docker logs docker-worker-1 2>&1 | grep -c 'cron:process_reflection failed'
+# Expected: 0
+```
+
+### No manual cron needed
+
+The reflection cron is built into the Worker's ARQ scheduler. Do NOT create a Hermes cron job for this — it will duplicate work and may confuse the Worker.
+
+---
+
+## Symptom: Qdrant `indexed_vectors_count` higher than `points_count`
+
+### It's normal
+
+This is NOT a bug. Each point can have multiple vectors (dense + sparse for BM25). `indexed_vectors_count` counts ALL vectors across ALL vector types, while `points_count` counts points.
+
+```
+# Example from our production instance:
+points: 354
+indexed_vectors: 666  ← higher, includes sparse BM25 vectors
+```
+
+The key health signal is: `indexed_vectors_count` should NOT be zero. If it's zero while `points_count > 20`, you have the indexing_threshold problem.
+
+---
+
+## Quick Health Check (automated)
+
+A Python script runs the complete 7-layer health check:
+
+```bash
+cd ~/Work/Projects/ReMem-hermes && python3 scripts/memory_health_check.py
+```
+
+Output covers: Docker services, Qdrant (points + index + dimension), Redis (AUTH + PING), Worker (logs + connectivity), fact_store (facts + FTS5), state.db (sessions + messages), and tool verification (fact_store + qdrant_search).
+
+---
+
 ## All Services Health Check (one command)
 
 ```bash

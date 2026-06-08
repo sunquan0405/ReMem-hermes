@@ -195,6 +195,139 @@ The Glue Layer sits in `rulebook.md` and `SOUL.md` — it tells the agent **whic
 
 ---
 
+## Model & Provider Configuration
+
+ReMem is a local-only memory stack with no cloud dependencies — **except** for the LLM and embedding APIs used by the Worker and Icarus hooks. By default, this project is configured for **China-based API providers** (DeepSeek + Qwen DashScope) because that's what our production instance uses. International users can switch to OpenRouter or OpenAI in minutes.
+
+### Default configuration (China)
+
+| Component | Provider | Model | Dims | Why |
+|-----------|----------|-------|------|-----|
+| **Embedding** | Qwen DashScope | `text-embedding-v4` | 1024 | Lowest cost for Chinese users, direct API |
+| **LLM (chat)** | DeepSeek Native | `deepseek-v4-flash` | — | DeepSeek's official API, no intermediary |
+| **LLM (extraction)** | DeepSeek Native | `deepseek-v4-flash` | — | Used by Icarus for session-end extraction |
+| **LLM (reflection)** | DeepSeek Native | `deepseek-v4-flash` | — | Worker's `process_reflection` cron |
+
+**Requirements for this setup:**
+- DeepSeek API key (register at [platform.deepseek.com](https://platform.deepseek.com))
+- Qwen DashScope API key (register at [dashscope.aliyun.com](https://dashscope.aliyun.com))
+- Both require a China phone number for registration and RMB payment method
+
+### International alternative (OpenRouter)
+
+OpenRouter works anywhere, no regional restrictions, and supports the same models via a unified API:
+
+| Component | Provider | Model | Dims | Change from default |
+|-----------|----------|-------|------|---------------------|
+| **Embedding** | OpenRouter | `qwen/qwen3-embedding-8b` | **4096** | Different model, different dimensions |
+| **LLM (chat)** | OpenRouter | `deepseek/deepseek-v4-flash` | — | Same model, just via OpenRouter |
+| **LLM (extraction)** | OpenRouter | `deepseek/deepseek-v4-flash` | — | Same as above |
+| **LLM (reflection)** | OpenRouter | `deepseek/deepseek-v4-flash` | — | Same as above |
+
+### How to switch (4 steps)
+
+**Step 1 — Set environment variables** (in `~/.hermes/.env` and `~/memory-os/docker/.env`):
+
+```bash
+# Switch embedding from Qwen DashScope → OpenRouter
+EMBEDDING_API_KEY=sk-or-v1-...                # Your OpenRouter key
+EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+EMBEDDING_MODEL=qwen/qwen3-embedding-8b
+
+# Switch LLM from DeepSeek Native → OpenRouter
+DEEPSEEK_API_KEY=sk-or-v1-...                 # Same OpenRouter key
+DEEPSEEK_BASE_URL=https://openrouter.ai/api/v1
+DEEPSEEK_MODEL=deepseek/deepseek-v4-flash
+```
+
+**Step 2 — Update Python code defaults** (5 files in `~/memory-os/` hardcode OpenRouter-compatible fallbacks, so they already work — but verify):
+
+```bash
+docker exec docker-worker-1 python3 -c "
+from services.embedding import EMBEDDING_API_BASE, EMBEDDING_MODEL, EMBEDDING_DIMS
+print(f'BASE: {EMBEDDING_API_BASE}')
+print(f'MODEL: {EMBEDDING_MODEL}')
+print(f'DIMS: {EMBEDDING_DIMS}')
+"
+# Should reflect your env settings
+```
+
+**Step 3 — ⚠️ Rebuild Qdrant collection (CRITICAL)**
+
+**This step deletes all indexed vectors.** Dimension mismatch (1024 → 4096 or vice versa) causes `qdrant_search` to fail silently.
+
+```bash
+QKEY=$(docker exec docker-qdrant-1 printenv QDRANT__SERVICE__API_KEY)
+
+# Delete old collection
+curl -s -X DELETE -H "api-key: $QKEY" http://127.0.0.1:6333/collections/knowledge_base
+
+# Create new collection with correct dimensions
+curl -s -X PUT -H "api-key: $QKEY" -H "Content-Type: application/json" \
+  http://127.0.0.1:6333/collections/knowledge_base -d '{
+    "vectors": {"dense": {"size": 4096, "distance": "Cosine"}},
+    "sparse_vectors": {"sparse": {}},
+    "on_disk_payload": true,
+    "optimizers_config": {"indexing_threshold": 20}
+  }'
+```
+
+**Step 4 — Re-index everything:**
+
+```bash
+# Re-run migration (memory entries)
+cd ~/memory-os && python3 scripts/migrate_from_hermes.py
+
+# Re-ingest wiki files
+rm -f ~/.hermes/wiki_ingest_state.json
+WIKI_ROOT=~/wiki REDIS_PASSWORD=$(docker exec docker-redis-1 printenv REDIS_PASSWORD) \
+  python3 ~/memory-os/scripts/wiki_continuous_ingest.py
+```
+
+**Alternative: OpenAI embeddings**
+
+```bash
+EMBEDDING_API_KEY=sk-...                       # Your OpenAI key
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-3-small          # 1536 dims
+```
+
+Same dimension-mismatch rules apply — rebuild Qdrant collection with `"size": 1536`.
+
+### Why Qwen DashScope by default?
+
+Our production instance (the one documented here) runs in China with DeepSeek native API and Qwen DashScope because:
+
+1. **Latency:** Direct API calls within China are 2-3x faster than routing through OpenRouter (US-hosted)
+2. **Cost:** Qwen DashScope embedding is ~$0.0003/1K tokens vs OpenRouter's ~$0.002/1K tokens (6x cheaper)
+3. **Stability:** No intermediary proxy — fewer failure points
+
+For international users, OpenRouter is the recommended alternative. The setup is nearly identical — just swap the endpoints and models in Step 1-4 above.
+
+### ⚠️ DeepSeek has NO embedding models
+
+All DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-chat`, `deepseek-reasoner`) are **chat-only**. They cannot generate embeddings. If you set `EMBEDDING_MODEL` to any DeepSeek model, the API returns `400 Bad Request` or times out.
+
+---
+
+### Current production metrics (2026-06-08)
+
+For reference, here are the live system metrics from our instance running the China-based config:
+
+| Metric | Value |
+|--------|-------|
+| Docker services | 3/3 healthy (Qdrant + Redis + Worker) |
+| Qdrant points | 354 (memory migration + wiki ingest) |
+| fact_store entries | 49 (6 categories) |
+| Fabric entries | 103 (auto-written by Icarus hooks) |
+| Session history | 330 sessions, 30,037 messages |
+| Embedding model | `text-embedding-v4` (Qwen DashScope, 1024-dim) |
+| Worker cron | `process_reflection` every 2h (even hours) |
+| Per-turn latency | ~10 ms memory search + 2-5s LLM API call |
+| Icarus hooks | 4/4 registered (v3, 18 tools) |
+
+---
+
 ## Troubleshooting
 
 Common issues and their fixes: [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
