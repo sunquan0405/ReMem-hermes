@@ -18,6 +18,7 @@
 - **We added the safety net:** `backup.sh` → `migrate_from_hermes.py` → `verify_integration.py` → `rollback.sh`. Install with confidence, revert in one command.
 - **We built the installation pipeline:** OrbStack + Docker Compose + env config + API key management — everything needed to go from zero to running in under 30 minutes.
 - **We documented the migration path:** 49 entries migrated, verified, searchable. Your existing memory is not lost — it's upgraded.
+- **We added the Knowledge Graph (v1.1):** The 5th memory layer — entity relations (`Hermes --[uses]--> DeepSeek`) as SQLite edges, injected via `pre_llm_call`, auto-extracted by LLM on session end. Zero new dependencies, zero additional cost. ([modifications/kg/](modifications/kg/))
 
 ---
 
@@ -70,18 +71,19 @@ We installed and measured on a production Hermes setup. Here's exactly what ReMe
 
 ### Per-turn latency
 
-Every user message triggers a `pre_llm_call` hook that searches all four memory sources:
+Every user message triggers a `pre_llm_call` hook that searches all **five** memory sources:
 
 ```
 User message
   ├── fabric_recall()          → local file read, <2 ms
   ├── _search_qdrant()         → Qdrant HTTP (localhost), ~5 ms
   ├── _search_sessions()       → SQLite FTS5 (local), ~2 ms
-  └── _search_facts()          → SQLite FTS5 (first turn only), ~2 ms
-                                   Total: ~9-11 ms added
+  ├── _search_facts()          → SQLite FTS5 (first turn only), ~2 ms
+  └── knowledge_graph()        → SQLite entity_relations, <1 ms
+                                   Total: ~10-12 ms added
 ```
 
-**10 ms per turn. You won't notice it.** The main latency remains the LLM API call (2-5 seconds on DeepSeek V4 Flash/Pro).
+**~12 ms per turn. You won't notice it.** The main latency remains the LLM API call (2-5 seconds on DeepSeek V4 Flash/Pro).
 
 ### Context overhead
 
@@ -129,7 +131,8 @@ To put that in perspective: a single `hermes chat` with DeepSeek V4 Pro costs mo
 | **Search** | ✗ Key-value lookup only | ✓ FTS5 keyword + Qdrant semantic vector search |
 | **Quality feedback** | ✗ Static | ✓ `fact_feedback` loop adjusts trust scores dynamically |
 | **Automatic cleanup** | ✗ Manual deletion | ✓ Decay scanner + semantic dedup |
-| **Cross-session recall** | ✗ Limited `session_search` | ✓ Fabric + Qdrant + fact_store multi-source injection |
+| **Cross-session recall** | ✗ Limited `session_search` | ✓ Fabric + Qdrant + fact_store + KG multi-source injection |
+| **Entity relations** | ✗ None | ✓ Knowledge Graph — directed edges, temporal validity, entity traversal |
 | **Ground Truth** | ✗ Implicit | ✓ Explicit 4-level hierarchy: terminal → injected memory → docs → training |
 | **Installation** | ✗ Not applicable | ✓ One command, 30 minutes, verified, rollback-ready |
 
@@ -310,7 +313,7 @@ All DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-chat`, `d
 
 ---
 
-### Current production metrics (2026-06-08)
+### Current production metrics (2026-06-09)
 
 For reference, here are the live system metrics from our instance running the China-based config:
 
@@ -319,12 +322,13 @@ For reference, here are the live system metrics from our instance running the Ch
 | Docker services | 3/3 healthy (Qdrant + Redis + Worker) |
 | Qdrant points | 354 (memory migration + wiki ingest) |
 | fact_store entries | 49 (6 categories) |
-| Fabric entries | 103 (auto-written by Icarus hooks) |
-| Session history | 330 sessions, 30,037 messages |
+| Fabric entries | 103+ (auto-written by Icarus hooks) |
+| Knowledge Graph | 200 entities, 24 relations (backfill + auto-extracted) |
+| Session history | 330+ sessions, 30,000+ messages |
 | Embedding model | `text-embedding-v4` (Qwen DashScope, 1024-dim) |
 | Worker cron | `process_reflection` every 2h (even hours) |
-| Per-turn latency | ~10 ms memory search + 2-5s LLM API call |
-| Icarus hooks | 4/4 registered (v3, 18 tools) |
+| Per-turn latency | ~12 ms memory search (5 sources) + 2-5s LLM API call |
+| Icarus hooks | 5/5 registered (fabric, Qdrant, sessions, facts, KG) |
 
 ---
 
