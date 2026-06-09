@@ -1,0 +1,92 @@
+# Memory OS — Docker Compose
+#
+# Starts Qdrant (vector DB), Redis (job queue), and ARQ Worker (embedding pipeline).
+# Copy .env.example to .env and fill in required values before running.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      sh -c '
+        mkdir -p /usr/local/etc/redis &&
+        echo "requirepass $${REDIS_PASSWORD}" > /usr/local/etc/redis/redis.conf &&
+        echo "bind 0.0.0.0" >> /usr/local/etc/redis/redis.conf &&
+        echo "appendonly yes" >> /usr/local/etc/redis/redis.conf &&
+        echo "maxmemory 512mb" >> /usr/local/etc/redis/redis.conf &&
+        echo "maxmemory-policy allkeys-lru" >> /usr/local/etc/redis/redis.conf &&
+        redis-server /usr/local/etc/redis/redis.conf
+      '
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "grep -q ':18BD' /proc/net/tcp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_WORKER_KEY}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
+      EMBEDDING_DIMS: "${EMBEDDING_DIMS:-1024}"
+      COLLECTION_NAME: "${COLLECTION_NAME:-knowledge_base}"
+      ARQ_JOB_TIMEOUT: "300"
+      ARQ_MAX_JOBS: "10"
+      ARQ_KEEP_RESULT: "3600"
+      no_proxy: "qdrant,redis,localhost,127.0.0.1,dashscope.aliyuncs.com"
+      NO_PROXY: "qdrant,redis,localhost,127.0.0.1,dashscope.aliyuncs.com"
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ${MEMORY_OS_WIKI_PATH:-./wiki}:/wiki:ro
+      - ${MEMORY_OS_HERMES_HOME:-./hermes}:/hermes:rw
+      - ${MEMORY_OS_FABRIC_DIR:-./fabric}:/fabric:rw
+      - hf_cache:/tmp/fastembed_cache
+
+volumes:
+  redis_data:
+  qdrant_data:
+  hf_cache:
