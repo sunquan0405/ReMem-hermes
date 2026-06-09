@@ -11,16 +11,6 @@ from pathlib import Path
 
 from . import state
 
-# ── Knowledge Graph service ──
-_kg_instance = None
-
-def _get_kg():
-    global _kg_instance
-    if _kg_instance is None:
-        from services.knowledge_graph import KnowledgeGraph
-        _kg_instance = KnowledgeGraph()
-    return _kg_instance
-
 # ── LLM extraction key ──
 _OPENROUTER_KEY = (
     os.environ.get("OPENROUTER_FULL_API_KEY", "")
@@ -148,10 +138,27 @@ _injected_sessions: set = set()
 
 
 def _tokenize(text):
+    # Latin + digits (existing behaviour)
     words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    return words - {"the", "a", "an", "is", "was", "are", "to", "of", "in", "for",
-                    "on", "with", "it", "and", "or", "not", "i", "you", "can", "do",
-                    "this", "that", "what", "how", "please", "help", "me", "my"}
+    # CJK characters and bigrams (Chinese / Japanese / Korean)
+    cjk_chars = re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]", text)
+    cjk_singles = set(cjk_chars)
+    cjk_bigrams = {cjk_chars[i] + cjk_chars[i+1] for i in range(len(cjk_chars)-1)}
+    all_tokens = words | cjk_singles | cjk_bigrams
+    # Stopwords: English + high-frequency Chinese
+    stopwords = {
+        "the", "a", "an", "is", "was", "are", "to", "of", "in", "for",
+        "on", "with", "it", "and", "or", "not", "i", "you", "can", "do",
+        "this", "that", "what", "how", "please", "help", "me", "my",
+        "的", "了", "是", "在", "我", "有", "和", "就", "不", "人",
+        "都", "一", "个", "上", "也", "很", "到", "说", "要", "去",
+        "你", "会", "着", "没", "看", "好", "自", "这", "能", "么",
+        # High-frequency CJK bigrams — too generic to be useful FTS5 signals
+        "一个", "没有", "不是", "就是", "什么", "可以", "需要",
+        "这个", "还有", "还是", "项目", "分析", "关系", "调整",
+        "定位", "问题", "情况", "时候", "影响", "当前",
+    }
+    return all_tokens - stopwords
 
 
 def _extract_theme(text):
@@ -277,7 +284,7 @@ def _is_social_close(text):
     return False
 
 
-def _search_qdrant(query, top_k=2, threshold=0.72):
+def _search_qdrant(query, top_k=2, threshold=0.35):
     """Search Qdrant knowledge_base via context_enhancer pipeline.
 
     Returns list of result dicts with keys: id, score, title,
@@ -291,7 +298,7 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
         if _OPENROUTER_KEY and not old_api_key:
             os.environ["OPENROUTER_API_KEY"] = _OPENROUTER_KEY
 
-        from scripts.context_enhancer import (
+        from .scripts.context_enhancer import (
             embed_query, embed_query_sparse, search_with_fallback
         )
         dense = embed_query(query)
@@ -303,6 +310,18 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
             top_k=top_k,
             score_threshold=threshold,
         )
+        # Score-drop heuristic: if top-N scores are flat (all within 0.08),
+        # the query produced weak semantic matches and results are noise.
+        # Qwen 1024-dim range: good matches drop 0.10-0.25, noise drops <0.05.
+        if len(results) >= 2:
+            scores = sorted([r.get("score", 0) for r in results], reverse=True)
+            drop = scores[0] - scores[-1]
+            if drop < 0.08:
+                return []
+        # Single result blind spot: a lone score 0.43 might still be noise.
+        # Require 0.50+ when there's nothing to compare against.
+        if len(results) == 1 and results[0].get("score", 0) < 0.50:
+            return []
         return results
     except Exception:
         return []
@@ -343,7 +362,11 @@ def _search_sessions(query, current_session_id="", top_k=2):
         return []
 
     # Build an FTS5 OR-query from meaningful tokens (avoids AND over-filtering)
-    toks = [t for t in _tokenize(query) if len(t) >= 4]
+    # Token filter: >=4 for ASCII, >=2 for CJK (bigrams are meaningful).
+    def _is_cjk_char(c):
+        return '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' or '\uf900' <= c <= '\ufaff'
+    toks = [t for t in _tokenize(query)
+            if len(t) >= 4 or (len(t) >= 2 and any(_is_cjk_char(c) for c in t))]
     if not toks:
         return []
     fts_query = " OR ".join(toks[:8])
@@ -417,7 +440,11 @@ def _search_facts(query, top_k=3):
     if not db.exists():
         return []
 
-    toks = [t for t in _tokenize(query) if len(t) >= 4]
+    # Token filter: >=4 for ASCII, >=2 for CJK (bigrams are meaningful).
+    def _is_cjk_char(c):
+        return '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' or '\uf900' <= c <= '\ufaff'
+    toks = [t for t in _tokenize(query)
+            if len(t) >= 4 or (len(t) >= 2 and any(_is_cjk_char(c) for c in t))]
     if not toks:
         return []
     fts_query = " OR ".join(toks[:8])
@@ -517,10 +544,6 @@ def _sanitize_context_text(text: str, max_len: int = 600) -> str:
 def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
     """Inject relevant memories when topic changes (fabric + Qdrant)."""
     global _last_query_tokens
-    logger.info(
-        "pre_llm_call: invoked session=%s first_turn=%s msg_len=%d",
-        session_id or "?", is_first_turn, len(user_message) if user_message else 0
-    )
     if not user_message:
         return None
 
@@ -554,7 +577,7 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
     # were silently filtered out by the old 0.72 gate.
     qdrant_results = []
     if not is_social:
-        qdrant_results = _search_qdrant(user_message, top_k=2, threshold=0.55)
+        qdrant_results = _search_qdrant(user_message, top_k=2, threshold=0.35)
 
     # ── Session history (FTS5 over state.db) — the layer that holds
     #    "this was already built in a prior session". No automatic injection
@@ -569,17 +592,8 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
     if is_first_turn and not is_social:
         fact_results = _search_facts(user_message, top_k=3)
 
-    # ── Knowledge Graph (entity relations) — every turn, cheap SQLite ──
-    kg_results = ""
-    if not is_social:
-        try:
-            kg = _get_kg()
-            kg_results = kg.format_context(user_message, max_edges=6)
-        except Exception as e:
-            logger.warning("KG search failed: %s", e)
-
     # ── Bail if nothing from any source ──
-    if not results and not qdrant_results and not session_results and not fact_results and not kg_results:
+    if not results and not qdrant_results and not session_results and not fact_results:
         return None
 
     parts = []
@@ -646,10 +660,6 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
         for f in fact_results:
             lines.append(f"  - {_sanitize_context_text(f, max_len=200)}")
         parts.append("\n".join(lines))
-
-    # Knowledge Graph context (entity relations, every turn)
-    if kg_results:
-        parts.append("[KG] entity relations:\n" + kg_results)
 
     if not parts:
         return None
@@ -770,25 +780,21 @@ def _build_transcript(exchanges):
 
 
 def _llm_extract_entries(transcript):
-    """Use LLM to extract significant entries + entities + relations from session transcript.
+    """Use LLM to extract significant entries from session transcript.
 
-    Returns tuple: (entries: list, entities: list[dict], relations: list[dict])
-    Each dict in entries: {type, summary, content, training_value}
-    Each dict in entities: {name, type}
-    Each dict in relations: {subject, relation, object}
-    Returns ([], [], []) on failure or if nothing worth preserving.
+    Returns list of dicts: {type, summary, content, training_value}
+    Returns empty list on failure or if nothing worth preserving.
     """
     api_key = _resolve_llm_api_key()
     if not api_key:
         logger.warning("icarus: no LLM API key found (checked ICARUS_API_KEY_ENV, "
                         "DEEPSEEK_API_KEY, OPENROUTER_API_KEY) — skipping LLM extraction")
-        return [], [], []
+        return []
 
     prompt = (
         "You are a session archivist for an AI agent. Analyze this agent session "
-        "transcript and extract:\n\n"
-        "### 1. Significant entries worth preserving in cross-agent knowledge base\n"
-        "Skip trivial sessions, greetings, and routine chatter.\n"
+        "transcript and extract ONLY significant entries worth preserving in a "
+        "cross-agent knowledge base. Skip trivial sessions, greetings, and routine chatter.\n\n"
         "For each significant entry, provide:\n"
         "- type: \"decision\" (technical decision with rationale), "
         "\"resolution\" (bug fix or problem solved), "
@@ -799,17 +805,10 @@ def _llm_extract_entries(transcript):
         "- training_value: \"high\" (outcome verified, artifact produced, decision with evidence), "
         "\"normal\" (useful context or progress), "
         "or \"low\" (marginal, but not zero)\n\n"
-        "### 2. Named entities mentioned in the session\n"
-        "Entity types: project | technology | tool | company | person | concept\n\n"
-        "### 3. Directed relations between entities\n"
-        "Relation types: uses | depends_on | replaces | part_of | mentioned_in | related_to\n"
-        "Only include relations that are EXPLICITLY stated or clearly implied in the transcript.\n\n"
-        "If the session contains NOTHING worth preserving, return:\n"
-        '{"entries": [], "entities": [], "relations": []}\n\n'
-        "Return ONLY valid JSON object with three keys, no other text:\n"
-        '{"entries": [{"type": "decision", "summary": "...", "content": "...", "training_value": "high"}, ...], '
-        '"entities": [{"name": "ProjectX", "type": "project"}, ...], '
-        '"relations": [{"subject": "ProjectX", "relation": "uses", "object": "DeepSeek"}, ...]}'
+        "If the session contains NOTHING worth preserving across sessions, "
+        "return an empty array: []\n\n"
+        "Return ONLY valid JSON array, no other text:\n"
+        '[{"type": "decision", "summary": "...", "content": "...", "training_value": "high"}, ...]'
     )
 
     payload = json.dumps({
@@ -836,35 +835,28 @@ def _llm_extract_entries(transcript):
         # Parse JSON from response (robust — handles markdown fences, null)
         if raw is None:
             raise ValueError("DeepSeek returned content:null (response_format bug)")
-        parsed = _parse_json_robust(raw)
+        extracted = _parse_json_robust(raw)
+        if isinstance(extracted, dict):
+            # Some models return {entries: [...]} — unwrap
+            for key in ("entries", "results", "items"):
+                if key in extracted and isinstance(extracted[key], list):
+                    extracted = extracted[key]
+                    break
+            else:
+                # Single entry wrapped in dict
+                if "type" in extracted:
+                    extracted = [extracted]
+                else:
+                    extracted = []
 
-        # New format: {"entries": [...], "entities": [...], "relations": [...]}
-        entries_raw = []
-        entities_raw = []
-        relations_raw = []
+        if not isinstance(extracted, list):
+            logger.warning("icarus: LLM extraction returned non-list: %s", type(extracted))
+            return []
 
-        if isinstance(parsed, dict):
-            entries_raw = parsed.get("entries", [])
-            entities_raw = parsed.get("entities", [])
-            relations_raw = parsed.get("relations", [])
-            # Fallback: if no entries key but has type → single entry
-            if not entries_raw and "type" in parsed:
-                entries_raw = [parsed]
-        elif isinstance(parsed, list):
-            # Legacy format: JSON array of entries
-            entries_raw = parsed
-
-        if not isinstance(entries_raw, list):
-            entries_raw = []
-        if not isinstance(entities_raw, list):
-            entities_raw = []
-        if not isinstance(relations_raw, list):
-            relations_raw = []
-
-        # Validate and filter entries
-        valid_entries = []
+        # Validate and filter
+        valid = []
         allowed_types = {"decision", "resolution", "note"}
-        for entry in entries_raw:
+        for entry in extracted:
             if not isinstance(entry, dict):
                 continue
             etype = entry.get("type", "")
@@ -874,46 +866,19 @@ def _llm_extract_entries(transcript):
                 continue
             if len(summary) < 10 or len(content) < 60:
                 continue
-            valid_entries.append({
+            valid.append({
                 "type": etype,
                 "summary": summary[:80],
                 "content": content[:2000],
                 "training_value": entry.get("training_value", "normal")
             })
 
-        # Validate entities
-        valid_entities = []
-        allowed_entity_types = {"project", "technology", "tool", "company", "person", "concept", "config", "skill"}
-        for ent in entities_raw:
-            if not isinstance(ent, dict):
-                continue
-            name = ent.get("name", "")
-            etype = ent.get("type", "unknown")
-            if not name or len(name) < 2:
-                continue
-            valid_entities.append({"name": name, "type": etype if etype in allowed_entity_types else "unknown"})
-
-        # Validate relations
-        valid_relations = []
-        allowed_relations = {"uses", "depends_on", "replaces", "part_of", "mentioned_in", "related_to"}
-        for rel in relations_raw:
-            if not isinstance(rel, dict):
-                continue
-            subj = rel.get("subject", "")
-            rel_type = rel.get("relation", "")
-            obj = rel.get("object", "")
-            if not subj or not obj or not rel_type:
-                continue
-            if rel_type not in allowed_relations:
-                continue
-            valid_relations.append({"subject": subj, "relation": rel_type, "object": obj})
-
-        return valid_entries, valid_entities, valid_relations
+        return valid
 
     except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError, ValueError,
             ConnectionError, TimeoutError, OSError) as e:
         logger.warning("icarus: LLM extraction failed (%s) — falling back to legacy", type(e).__name__)
-        return [], [], []
+        return []
 
 
 def _legacy_session_write(platform, scores):
@@ -964,10 +929,6 @@ def _legacy_session_write(platform, scores):
 
 def on_session_end(session_id="", platform="", completed=False, **kwargs):
     """Score session, extract entries via LLM, fall back to legacy truncation."""
-    logger.info(
-        "on_session_end: invoked session=%s platform=%s completed=%s exchanges=%d",
-        session_id or "?", platform or "cli", completed, len(state.exchanges) if state.exchanges else 0
-    )
     creative = state.load_creative()
     state.write_memory_file(creative)
 
@@ -982,7 +943,7 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
 
     # ── LLM extraction (primary) ──
     transcript = _build_transcript(state.exchanges)
-    entries, entities, relations = _llm_extract_entries(transcript)
+    entries = _llm_extract_entries(transcript)
 
     if entries:
         for entry in entries:
@@ -995,30 +956,6 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
                 status="completed"
             )
         logger.info("icarus: LLM extracted %d entries from session", len(entries))
-
-        # Write entities and relations to Knowledge Graph
-        if entities:
-            try:
-                kg = _get_kg()
-                added_entities = 0
-                for ent in entities:
-                    kg.add_entity(ent["name"], ent["type"])
-                    added_entities += 1
-                logger.info("icarus: KG added %d entities", added_entities)
-            except Exception as e:
-                logger.warning("icarus: KG entity write failed: %s", e)
-
-        if relations:
-            try:
-                kg = _get_kg()
-                added_relations = 0
-                for rel in relations:
-                    if kg.add_relation(rel["subject"], rel["relation"], rel["object"],
-                                       source=f"session:{session_id[:12]}"):
-                        added_relations += 1
-                logger.info("icarus: KG added %d relations", added_relations)
-            except Exception as e:
-                logger.warning("icarus: KG relation write failed: %s", e)
     else:
         # ── Legacy fallback ──
         logger.info("icarus: LLM extraction produced nothing — using legacy truncation")
