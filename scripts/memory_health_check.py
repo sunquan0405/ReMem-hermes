@@ -18,6 +18,7 @@ Dependencies: stdlib only (subprocess, sqlite3, socket, json, urllib)
 
 import json
 import os
+import re
 import sqlite3
 import socket
 import subprocess
@@ -214,33 +215,70 @@ def check_worker():
     print(f"\n  {BOLD}[4] Worker (docker logs){NC}")
     print()
 
-    code, out, _ = run(["docker", "logs", "docker-worker-1", "--tail", "10"],
+    # 1. Docker health status (authoritative — not log-grep dependent)
+    all_ok = True
+    code, health, _ = run(
+        ["docker", "inspect", "docker-worker-1",
+         "--format", "{{.State.Health.Status}}"]
+    )
+    if code != 0 or not health:
+        fail("docker-worker-1 not found or no health status")
+        return False
+
+    if health == "healthy":
+        ok(f"docker health: {health}")
+    else:
+        fail(f"docker health: {health}")
+        all_ok = False
+
+    # 2. Recent ARQ log activity (wider window, 30 lines — startup message
+    #    ages out after hours; real activity (job completion, embedding calls)
+    #    persists in recent logs)
+    code, out, _ = run(["docker", "logs", "docker-worker-1", "--tail", "30"],
                         merge_output=True)
     if code != 0:
-        if "No such container" in out or "not found" in out:
-            fail("docker-worker-1 not found")
-        else:
-            fail(f"docker logs failed: {out}")
-        return False
+        warn(f"docker logs failed: {out}")
+        return all_ok
 
     lines = [l for l in out.split("\n") if l.strip()]
     ok(f"last {len(lines)} log lines:")
-    for line in lines:
+
+    # Show only the last 8 lines to avoid noise, but search all 30
+    display_lines = lines[-8:] if len(lines) > 8 else lines
+    for line in display_lines:
         info(line.strip())
 
-    checks = {
-        "ARQ worker running": "arq.worker" in out,
-        "Connected to Qdrant": "Connected to Qdrant" in out,
-    }
+    # Multi-factor ARQ activity check (not single-string grep)
+    arq_present = "arq.worker" in out
+    job_complete = re.search(r"j_complete=(\d+)", out)
+    embedding_ok = "dashscope.aliyuncs.com" in out and "200 OK" in out
+    qdrant_ok = "qdrant:6333" in out and "200 OK" in out
 
-    all_ok = True
-    for label, found in checks.items():
-        if found:
-            ok(label)
-        else:
-            warn(f"{label} — not found in recent logs")
-            all_ok = False
-    return all_ok
+    if arq_present:
+        ok("ARQ worker running in logs")
+    else:
+        warn("ARQ worker — not found in recent logs")
+
+    if job_complete:
+        ok(f"jobs completed: {job_complete.group(1)}")
+    else:
+        warn("no completed job count in recent logs")
+
+    if embedding_ok:
+        ok("DashScope embedding: 200 OK")
+    else:
+        info("no recent embedding calls in log window")
+        # Not a failure — embedding only runs when needed
+
+    if qdrant_ok:
+        ok("Qdrant upsert: 200 OK")
+    else:
+        info("no recent Qdrant calls in log window")
+        # Not a failure — Qdrant only called when needed
+
+    # Worker is healthy if: docker says healthy AND ARQ is running
+    # (embedding/Qdrant may not appear in a 30-line window if idle)
+    return all_ok and arq_present
 
 
 def check_memory_store():
