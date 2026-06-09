@@ -14,3 +14,6 @@ venv/
 .idea/
 *.swp
 *.swo
+docker/.env
+docker/.env.bak.*
+docker/*.bak.*
